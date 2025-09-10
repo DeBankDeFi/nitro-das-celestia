@@ -8,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	txclient "github.com/celestiaorg/celestia-node/api/client"
+	node "github.com/celestiaorg/celestia-node/api/rpc/client"
 	"github.com/celestiaorg/celestia-node/blob"
 	"github.com/celestiaorg/celestia-node/nodebuilder/p2p"
 	"github.com/celestiaorg/celestia-node/state"
@@ -31,26 +33,27 @@ import (
 )
 
 type DAConfig struct {
-	Enable             bool            `koanf:"enable"`
-	GasPrice           float64         `koanf:"gas-price" reload:"hot"`
-	GasMultiplier      float64         `koanf:"gas-multiplier" reload:"hot"`
-	Rpc                string          `koanf:"rpc" reload:"hot"`
-	ReadRpc            string          `koanf:"read-rpc" reload:"hot"`
-	NamespaceId        string          `koanf:"namespace-id" `
-	AuthToken          string          `koanf:"auth-token" reload:"hot"`
-	ReadAuthToken      string          `koanf:"read-auth-token" reload:"hot"`
-	CoreToken          string          `koanf:"core-token" reload:"hot"`
-	CoreURL            string          `koanf:"core-url" reload:"hot"`
-	CoreNetwork        string          `koanf:"core-network" reload:"hot"`
-	KeyName            string          `koanf:"key-name" reload:"hot"`
-	KeyPath            string          `koanf:"key-path" reload:"hot"`
-	BackendName        string          `koanf:"backend-name" reload:"hot"`
-	NoopWriter         bool            `koanf:"noop-writer" reload:"hot"`
-	EnableDATLS        bool            `koanf:"enable-da-tls" reload:"hot"`
-	EnableCoreTLS      bool            `koanf:"enable-core-tls" reload:"hot"`
-	ValidatorConfig    ValidatorConfig `koanf:"validator-config" reload:"hot"`
-	ReorgOnReadFailure bool            `koanf:"dangerous-reorg-on-read-failure"`
-	CacheCleanupTime   time.Duration   `koanf:"cache-time"`
+	WithWriter           bool            `koanf:"with-writer"`
+	GasPrice             float64         `koanf:"gas-price" reload:"hot"`
+	GasMultiplier        float64         `koanf:"gas-multiplier" reload:"hot"`
+	Rpc                  string          `koanf:"rpc" reload:"hot"`
+	ReadRpc              string          `koanf:"read-rpc" reload:"hot"`
+	NamespaceId          string          `koanf:"namespace-id" `
+	AuthToken            string          `koanf:"auth-token" reload:"hot"`
+	ReadAuthToken        string          `koanf:"read-auth-token" reload:"hot"`
+	CoreToken            string          `koanf:"core-token" reload:"hot"`
+	CoreURL              string          `koanf:"core-url" reload:"hot"`
+	CoreNetwork          string          `koanf:"core-network" reload:"hot"`
+	KeyName              string          `koanf:"key-name" reload:"hot"`
+	KeyPath              string          `koanf:"key-path" reload:"hot"`
+	BackendName          string          `koanf:"backend-name" reload:"hot"`
+	NoopWriter           bool            `koanf:"noop-writer" reload:"hot"`
+	EnableDATLS          bool            `koanf:"enable-da-tls" reload:"hot"`
+	EnableCoreTLS        bool            `koanf:"enable-core-tls" reload:"hot"`
+	ValidatorConfig      ValidatorConfig `koanf:"validator-config" reload:"hot"`
+	ReorgOnReadFailure   bool            `koanf:"dangerous-reorg-on-read-failure"`
+	CacheCleanupTime     time.Duration   `koanf:"cache-time"`
+	ExperimentalTxClient bool            `koanf:"experimental-tx-client"`
 }
 
 type ValidatorConfig struct {
@@ -96,8 +99,9 @@ func IsCelestiaMessageHeaderByte(header byte) bool {
 
 type CelestiaDA struct {
 	Cfg        *DAConfig
-	Client     *txclient.Client
-	ReadClient *txclient.Client
+	Client     *node.Client
+	TxClient   *txclient.Client
+	ReadClient *txclient.ReadClient
 
 	Namespace *libshare.Namespace
 
@@ -105,7 +109,8 @@ type CelestiaDA struct {
 }
 
 func CelestiaDAConfigAddOptions(prefix string, f *pflag.FlagSet) {
-	f.Bool(prefix+".enable", false, "Enable Celestia DA")
+	f.Bool(prefix+".with-writer", false, "Enable using the DA Server for writing data to Celestia")
+	f.Bool(prefix+".experimental-tx-client", false, "Enable using the DA Server for writing data to Celestia")
 	f.Float64(prefix+".gas-price", 0.01, "Gas for retrying Celestia transactions")
 	f.Float64(prefix+".gas-multiplier", 1.01, "Gas multiplier for Celestia transactions")
 	f.String(prefix+".rpc", "", "Rpc endpoint for celestia-node")
@@ -116,8 +121,8 @@ func CelestiaDAConfigAddOptions(prefix string, f *pflag.FlagSet) {
 	f.String(prefix+".core-token", "", "Auth token for Core Celestia Node Endpoint")
 	f.String(prefix+".core-url", "", "URL to Celestia Core endpoint")
 	f.String(prefix+".core-network", "celestia", "Celestia Network to use")
-	f.String(prefix+".key-name", "my_key", "key name to use")
-	f.String(prefix+".key-path", "./keys", "key path to use")
+	f.String(prefix+".key-name", "my_celes_key", "key name to use")
+	f.String(prefix+".key-path", "", "key path to use")
 	f.String(prefix+".backend-name", "test", "keyring backend to use")
 	f.Bool(prefix+".enable-da-tls", false, "enable TLS for DA node")
 	f.Bool(prefix+".enable-core-tls", false, "enable TLS for Core node")
@@ -129,65 +134,35 @@ func CelestiaDAConfigAddOptions(prefix string, f *pflag.FlagSet) {
 	f.Duration(prefix+".cache-time", time.Hour/2, "how often to clean the in memory cache")
 }
 
+// DefaultKeyringPath constructs the default keyring path using the given
+// node type and network.
+var DefaultKeyringPath = func(tp string, network string) (string, error) {
+	home := os.Getenv("CELESTIA_HOME")
+	if home != "" {
+		return home, nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+
+	if network == "mainnet" {
+		return fmt.Sprintf("%s/.celestia-%s/keys", home, strings.ToLower(tp)), nil
+	}
+	// only include network name in path for testnets and custom networks
+	return fmt.Sprintf(
+		"%s/.celestia-%s-%s/keys",
+		home,
+		strings.ToLower(tp),
+		strings.ToLower(network),
+	), nil
+}
+
 func NewCelestiaDA(cfg *DAConfig) (*CelestiaDA, error) {
 	if cfg == nil {
 		return nil, errors.New("celestia cfg cannot be blank")
 	}
-
-	// Create a keyring
-	_, err := txclient.KeyringWithNewKey(txclient.KeyringConfig{
-		KeyName:     cfg.KeyName,
-		BackendName: cfg.BackendName,
-	}, cfg.KeyPath)
-	if err != nil {
-		return nil, err
-	}
-
-	// Configure the client
-	clientCfg := txclient.Config{
-		ReadConfig: txclient.ReadConfig{
-			BridgeDAAddr: cfg.Rpc,
-			DAAuthToken:  cfg.AuthToken,
-			EnableDATLS:  cfg.EnableDATLS,
-		},
-		SubmitConfig: txclient.SubmitConfig{
-			DefaultKeyName: cfg.KeyName,
-			Network:        p2p.Network(cfg.CoreNetwork),
-			CoreGRPCConfig: txclient.CoreGRPCConfig{
-				Addr:       cfg.CoreURL,
-				TLSEnabled: cfg.EnableCoreTLS,
-				AuthToken:  cfg.CoreToken,
-			},
-		},
-	}
-
-	readClient, err := txclient.NewReadClient(context.Background(), clientCfg.ReadConfig)
-	if err != nil {
-		log.Error("DEBUG: Failed to create celestia client", "err", err, "BridgeDAAddr", clientCfg.ReadConfig.BridgeDAAddr, "CoreAddr", clientCfg.SubmitConfig.CoreGRPCConfig.Addr)
-		return nil, err
-	}
-
-	celestiaClient := &txclient.Client{
-		ReadClient: *readClient,
-	}
-	// if cfg.ReadRpc != "" && cfg.ReadAuthToken != "" {
-	// 	log.Info("DEBUG: Configuring read client", "cfg.ReadRpc", cfg.ReadRpc)
-	// 	readClientCfg := txclient.Config{
-	// 		ReadConfig: txclient.ReadConfig{
-	// 			BridgeDAAddr: cfg.ReadRpc,
-	// 			DAAuthToken:  cfg.ReadAuthToken,
-	// 			EnableDATLS:  cfg.EnableDATLS,
-	// 		},
-	// 	}
-	// 	log.Info("DEBUG: About to create read client", "ReadBridgeDAAddr", readClientCfg.ReadConfig.BridgeDAAddr)
-	// 	readClient, err = txclient.New(context.Background(), readClientCfg, kr)
-	// 	if err != nil {
-	// 		log.Error("DEBUG: Failed to create read client", "err", err, "ReadBridgeDAAddr", readClientCfg.ReadConfig.BridgeDAAddr)
-	// 		return nil, err
-	// 	}
-	// } else {
-	// 	readClient = celestiaClient
-	// }
 
 	if cfg.NamespaceId == "" {
 		return nil, errors.New("namespace id cannot be blank")
@@ -202,10 +177,106 @@ func NewCelestiaDA(cfg *DAConfig) (*CelestiaDA, error) {
 		return nil, err
 	}
 
+	var readClient *txclient.ReadClient
+	var writeClient *txclient.Client
+	var daClient *node.Client
+
+	// use dedicated read rpc or use the same as the da-client
+	var readConfig txclient.ReadConfig
+	if cfg.ReadRpc != "" && cfg.ReadAuthToken != "" {
+		readConfig = txclient.ReadConfig{
+			BridgeDAAddr: cfg.ReadRpc,
+			DAAuthToken:  cfg.ReadAuthToken,
+			EnableDATLS:  cfg.EnableDATLS,
+		}
+	} else {
+		readConfig = txclient.ReadConfig{
+			BridgeDAAddr: cfg.Rpc,
+			DAAuthToken:  cfg.AuthToken,
+			EnableDATLS:  cfg.EnableDATLS,
+		}
+	}
+
+	if cfg.WithWriter {
+		// compatibility to connect with a light node / bridge node without grpc
+		// grpc client currently under "experimental"
+		if cfg.ExperimentalTxClient {
+			var err error
+			if cfg.KeyPath == "" {
+				cfg.KeyPath, err = DefaultKeyringPath("light", cfg.CoreNetwork)
+			}
+
+			log.Info("Key path", "path", cfg.KeyPath)
+			// Create a keyring
+			kr, err := txclient.KeyringWithNewKey(txclient.KeyringConfig{
+				KeyName:     cfg.KeyName,
+				BackendName: cfg.BackendName,
+			}, cfg.KeyPath)
+			if err != nil {
+				log.Error("failed to create keyring")
+				return nil, err
+			}
+
+			if cfg.CoreURL == "" {
+				cfg.CoreURL = cfg.Rpc
+			}
+
+			log.Info("Core URL: ", "url", cfg.CoreURL)
+
+			// Configure the client
+			clientCfg := txclient.Config{
+				ReadConfig: txclient.ReadConfig{
+					BridgeDAAddr: cfg.Rpc,
+					DAAuthToken:  cfg.AuthToken,
+					EnableDATLS:  cfg.EnableDATLS,
+				},
+				SubmitConfig: txclient.SubmitConfig{
+					DefaultKeyName: cfg.KeyName,
+					Network:        p2p.Network(cfg.CoreNetwork),
+					CoreGRPCConfig: txclient.CoreGRPCConfig{
+						Addr:       cfg.CoreURL,
+						TLSEnabled: cfg.EnableCoreTLS,
+						AuthToken:  cfg.CoreToken,
+					},
+				},
+			}
+
+			writeClient, err = txclient.New(context.Background(), clientCfg, kr)
+			if err != nil {
+				log.Error("failed to initialize client", "err", err)
+				return nil, err
+			}
+
+			readClient, err = txclient.NewReadClient(context.Background(), readConfig)
+			if err != nil {
+				log.Error("error initializing read client", "err", err)
+				return nil, err
+			}
+
+			log.Info("Succesfully initialized write and read experimental txclient", "writeRpc", cfg.CoreURL, "readRpc", readConfig.BridgeDAAddr)
+		} else {
+			daClient, err = node.NewClient(context.Background(), cfg.Rpc, cfg.AuthToken)
+			if err != nil {
+				log.Error("could not initialize node client for da rpc", "err", err)
+				return nil, err
+			}
+		}
+
+	} else {
+		var err error
+		readClient, err = txclient.NewReadClient(context.Background(), readConfig)
+		if err != nil {
+			log.Error("could not initialize txclient.ReadClient", "err", err)
+			return nil, err
+		}
+		log.Info("Succesfully initialized read only client", "rpc", cfg.Rpc)
+	}
+
 	da := &CelestiaDA{
 		Cfg:        cfg,
-		Client:     celestiaClient,
-		ReadClient: celestiaClient,
+		Client:     daClient,
+		TxClient:   writeClient,
+		ReadClient: readClient,
 		Namespace:  &namespace,
 	}
 
@@ -216,6 +287,10 @@ func NewCelestiaDA(cfg *DAConfig) (*CelestiaDA, error) {
 
 func (c *CelestiaDA) Stop() error {
 	c.Client.Close()
+	c.ReadClient.Close()
+	if c.Cfg.ExperimentalTxClient {
+		c.TxClient.Close()
+	}
 	return nil
 }
 
@@ -236,6 +311,11 @@ func (c *CelestiaDA) Store(ctx context.Context, message []byte) ([]byte, error) 
 		log.Warn("NoopWriter enabled, falling back", "c.Cfg.NoopWriter", c.Cfg.NoopWriter)
 		celestiaFailureCounter.Inc(1)
 		return nil, errors.New("NoopWriter enabled")
+	}
+
+	if !c.Cfg.WithWriter {
+		log.Warn("Attempted to call Store() without writer enabled", "cfg.withWriter", c.Cfg.WithWriter)
+		return nil, errors.New("writer not enabled")
 	}
 
 	// Create hash of message to use as cache key
@@ -268,7 +348,12 @@ func (c *CelestiaDA) Store(ctx context.Context, message []byte) ([]byte, error) 
 		// add submit options
 		submitOptions := &blob.SubmitOptions{}
 		state.WithGasPrice(gasPrice)(submitOptions)
-		height, err = c.Client.Blob.Submit(ctx, []*blob.Blob{dataBlob}, submitOptions)
+		if c.Cfg.ExperimentalTxClient {
+			height, err = c.TxClient.Blob.Submit(ctx, []*blob.Blob{dataBlob}, submitOptions)
+
+		} else {
+			height, err = c.Client.Blob.Submit(ctx, []*blob.Blob{dataBlob}, submitOptions)
+		}
 		if err != nil {
 			switch {
 			case strings.Contains(err.Error(), ErrTxTimedout.Error()), strings.Contains(err.Error(), ErrTxAlreadyInMempool.Error()), strings.Contains(err.Error(), ErrTxIncorrectAccountSequence.Error()):
@@ -611,7 +696,7 @@ func (c *CelestiaDA) GetProof(ctx context.Context, msg []byte) ([]byte, error) {
 	log.Info("Verified Celestia Attestation", "height", blobPointer.BlockHeight, "valid", valid)
 
 	if valid {
-		rangeResult, err := c.Client.Share.GetRange(ctx, blobPointer.BlockHeight, int(blobPointer.Start), int(blobPointer.Start+blobPointer.SharesLength))
+		rangeResult, err := c.ReadClient.Share.GetRange(ctx, blobPointer.BlockHeight, int(blobPointer.Start), int(blobPointer.Start+blobPointer.SharesLength))
 		if err != nil {
 			celestiaValidationFailureCounter.Inc(1)
 			log.Error("Unable to get ShareProof", "err", err)
